@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Real-Time Translator (Samsung/Android)</title>
+  <title>Real-Time Translator (Samsung/Android Fixed)</title>
 
   <style>
     body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
@@ -73,11 +73,12 @@
 
   <script>
     // =========================
-    // Standalone Samsung/Android Translator
-    // - SpeechRecognition (Chrome/Samsung Internet)
-    // - MyMemory translation (free)
-    // - SpeechSynthesis playback (Android voices)
-    // - Auto chunking via silence + punctuation + max length
+    // Standalone Samsung/Android Translator (FIXED)
+    // Fixes:
+    // 1) De-duplication for Android SpeechRecognition repeats
+    // 2) Clear mic status
+    // 3) Lock language selects while recording
+    // 4) Cancel speech before speaking to avoid overlaps
     // =========================
 
     // ---------- UI ----------
@@ -118,6 +119,12 @@
       statusEl.textContent = msg || "";
     }
 
+    function updateUIForListening() {
+      fromLang.disabled = listening;
+      toLang.disabled = listening;
+      setStatus(listening ? "🎧 Listening…" : "⏹️ Stopped");
+    }
+
     // ---------- Safety: HTML escaping ----------
     function escapeHtml(str) {
       return String(str)
@@ -126,6 +133,25 @@
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+    }
+
+    // ---------- Android de-dup helper ----------
+    // Android interim/final results often resend previous words.
+    // This tries to keep only the newest text without repeating.
+    function appendUnique(existing, incoming) {
+      const e = (existing || "").trim();
+      const i = (incoming || "").trim();
+      if (!e) return i;
+      if (!i) return e;
+
+      // If incoming contains existing at the start, incoming is "more complete"
+      if (i.startsWith(e)) return i;
+
+      // If existing already ends with incoming, keep existing
+      if (e.endsWith(i)) return e;
+
+      // Otherwise, append (best effort)
+      return (e + " " + i).trim();
     }
 
     // ---------- MyMemory translate ----------
@@ -158,7 +184,7 @@
       const voice = pickBestVoice(lang);
       if (voice) u.voice = voice;
 
-      // Cancel helps prevent overlapping spam on Android
+      // Prevent stacking overlapping speech on Android
       speechSynthesis.cancel();
       speechSynthesis.speak(u);
     }
@@ -244,7 +270,7 @@
             }
           }, 250);
         } else {
-          setStatus("🛑 Stopped");
+          updateUIForListening();
         }
       };
 
@@ -257,7 +283,8 @@
           if (!t) continue;
 
           if (event.results[i].isFinal) {
-            stableText = (stableText + " " + t).trim();
+            // ✅ FIX: de-dup instead of blindly appending
+            stableText = appendUnique(stableText, t);
             lastPartial = "";
           } else {
             interim = t;
@@ -308,7 +335,7 @@
           recognition.start();
           listening = true;
           toggleBtn.textContent = "⏹ Stop";
-          setStatus("🎧 Listening…");
+          updateUIForListening();
         } catch (e) {
           console.warn("start error:", e);
           setStatus("⚠️ Could not start mic. Grant permission, then tap Start again.", true);
@@ -316,6 +343,8 @@
       } else {
         listening = false;
         toggleBtn.textContent = "▶ Start";
+        updateUIForListening();
+
         try { recognition.stop(); } catch(e) {}
 
         // flush what we have
@@ -363,8 +392,10 @@
       setStatus("");
     });
 
-    // Helpful note for users opening the page
-    setStatus("Tip: On Samsung, open in Chrome or Samsung Internet. Tap 'Enable Audio' before you want speech playback.");
+    // Initial status
+    updateUIForListening();
+    setStatus("Tip: On Samsung, open in Chrome or Samsung Internet. Tap 'Enable Audio' before speech playback.");
   </script>
 </body>
 </html>
+
