@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Real-Time Translator (Samsung)</title>
+
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+    button {
+      padding: 12px 20px; margin: 10px; font-size: 16px; border-radius: 10px;
+      border: none; background: #007BFF; color: white; cursor: pointer;
+    }
+    button:disabled { background: gray; cursor: not-allowed; }
+    select { padding: 8px; font-size: 16px; margin: 5px; }
+    #translations, #liveText {
+      margin-top: 20px; text-align: left; max-width: 520px; margin-left: auto; margin-right: auto;
+      background: #f8f8f8; padding: 15px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    }
+    #translations { max-height: 280px; overflow-y: auto; }
+    .chunk {
+      padding: 8px 40px 8px 8px; margin-bottom: 8px; border-radius: 8px;
+      background-color: #e0f7fa; position: relative; line-height: 1.25;
+    }
+    .replayBtn {
+      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+      background: #007BFF; color: white; border: none; border-radius: 6px;
+      padding: 4px 8px; cursor: pointer; font-size: 12px;
+    }
+    #liveText { font-style: italic; color: #333; }
+    .small { font-size: 12px; color: #555; margin-top: 10px; }
+  </style>
+</head>
+
+<body>
+  <h1>Real-Time Translator 🌍</h1>
+  <p>Select languages and press Start:</p>
+
+  <button id="enableAudioBtn">🔊 Enable Audio</button>
+
+  <label for="fromLang">🎤 Input Language:</label>
+  <select id="fromLang">
+    <option value="en-US">English</option>
+    <option value="es-ES">Spanish</option>
+    <option value="fr-FR">French</option>
+    <option value="de-DE">German</option>
+    <option value="sv-SE">Swedish</option>
+  </select>
+
+  <label for="toLang">🔊 Output Language:</label>
+  <select id="toLang">
+    <option value="en-US">English</option>
+    <option value="es-ES">Spanish</option>
+    <option value="fr-FR">French</option>
+    <option value="de-DE">German</option>
+    <option value="sv-SE">Swedish</option>
+  </select>
+
+  <br /><br />
+
+  <button id="toggleBtn">▶ Start</button>
+  <button id="replayAllBtn">🔁 Replay All</button>
+  <button id="clearBtn">🧹 Clear All</button>
+
+  <div id="liveText">🎙️ Live text will appear here...</div>
+  <div id="translations"></div>
+  <div class="small" id="status"></div>
+
+  <script>
+    // ---------- UI ----------
+    const enableAudioBtn = document.getElementById("enableAudioBtn");
+    const toggleBtn = document.getElementById("toggleBtn");
+    const replayAllBtn = document.getElementById("replayAllBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const translationsDiv = document.getElementById("translations");
+    const liveText = document.getElementById("liveText");
+    const fromLang = document.getElementById("fromLang");
+    const toLang = document.getElementById("toLang");
+    const statusEl = document.getElementById("status");
+
+    // ---------- Speech Recognition (Samsung/Android) ----------
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+
+    let listening = false;
+    let audioEnabled = false;
+
+    // Chunking state
+    let stableText = "";
+    let lastPartial = "";
+    let silenceTimer = null;
+
+    // Tuning knobs (Samsung-friendly defaults)
+    const SILENCE_MS = 900;          // commit after ~0.9s of no updates
+    const MAX_CHUNK_CHARS = 180;     // force commit if too long (prevents runaway)
+    const PUNCTUATION_RE = /[.!?。！？]$/;
+
+    // Replay memory
+    let allTranslations = [];
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
+    }
+
+    enableAudioBtn.addEventListener("click", () => {
+      // Must be user-gesture to allow audio on many mobile browsers
+      audioEnabled = true;
+      enableAudioBtn.disabled = true;
+      enableAudioBtn.textContent = "✅ Audio Enabled";
+      speak("Audio enabled", toLang.value);
+    });
+
+    function initRecognition() {
+      if (!SpeechRecognition) {
+        alert("Speech Recognition is not supported in this browser on this device.");
+        return null;
+      }
+
+      const r = new SpeechRecognition();
+      r.continuous = true;     // Android may still stop; we auto-restart
+      r.interimResults = true;
+      r.maxAlternatives = 1;
+
+      r.onstart = () => setStatus("🎧 Listening…");
+      r.onerror = (e) => {
+        console.warn("Recognition error:", e);
+        setStatus("⚠️ Mic/recognition error: " + (e.error || "unknown"));
+        // Some errors happen transiently; keep UX stable.
+      };
+
+      r.onend = () => {
+        setStatus("⏸️ Recognition ended");
+        // Android browsers frequently end recognition; auto-restart if user is still "listening"
+        if (listening) {
+          setTimeout(() => {
+            try {
+              r.start();
+              setStatus("🔁 Restarted listening…");
+            } catch (err) {
+              // start() can throw if called too quickly
+              console.warn("Restart failed:", err);
+              setTimeout(() => {
+                try { r.start(); } catch(e2) {}
+              }, 800);
+            }
+          }, 250);
+        }
+      };
+
+      r.onresult = (event) => {
+        if (silenceTimer) clearTimeout(silenceTimer);
+
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const t = (event.results[i][0].transcript || "").trim();
+          if (!t) continue;
+
+          if (event.results[i].isFinal) {
+            stableText = (stableText + " " + t).trim();
+            lastPartial = "";
+          } else {
+            interim = t; // most recent interim
+            lastPartial = t;
+          }
+        }
+
+        const display = (stableText + " " + (interim || "")).trim();
+        liveText.textContent = display ? ("🎙️ " + display) : "🎙️ …";
+
+        // Commit on punctuation (natural sentence end)
+        if (display && PUNCTUATION_RE.test(display)) {
+          commitChunk(display);
+          return;
+        }
+
+        // Commit if chunk is getting too long
+        if (display.length >= MAX_CHUNK_CHARS) {
+          commitChunk(display);
+          return;
+        }
+
+        // Commit after silence gap
+        silenceTimer = setTimeout(() => {
+          const finalish = (stableText + " " + lastPartial).trim();
+          if (finalish) commitChunk(finalish);
+        }, SILENCE_MS);
+      };
+
+      return r;
+    }
+
+    // ---------- Translation ----------
+    async function translateText(text, fromBcp47, toBcp47) {
+      // MyMemory needs ISO 639-1 codes like en|es, not BCP-47 like en-US
+      const from = fromBcp47.split("-")[0];
+      const to = toBcp47.split("-")[0];
+
+      const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      return data?.responseData?.translatedText || "(translation failed)";
+    }
+
+    function addTranslation(original, translated) {
+      const chunkDiv = document.createElement("div");
+      chunkDiv.className = "chunk";
+      chunkDiv.innerHTML = `<strong>${escapeHtml(original)}</strong><br/>→ ${escapeHtml(translated)}`;
+
+      const replayBtn = document.createElement("button");
+      replayBtn.textContent = "🔊";
+      replayBtn.className = "replayBtn";
+      replayBtn.onclick = () => speak(translated, toLang.value);
+
+      chunkDiv.appendChild(replayBtn);
+      translationsDiv.appendChild(chunkDiv);
+      translationsDiv.scrollTop = translationsDiv.scrollHeight;
+
+      allTranslations.push(translated);
+    }
+
+    // ---------- TTS ----------
+    function pickBestVoice(lang) {
+      const voices = speechSynthesis.getVoices() || [];
+      if (!voices.length) return null;
+
+      // Prefer exact match (en-US), then same language (en)
+      const exact = voices.find(v => (v.lang || "").toLowerCase() === lang.toLowerCase());
+      if (exact) return exact;
+
+      const base = lang.split("-")[0].toLowerCase();
+      const near = voices.find(v => (v.lang || "").toLowerCase().startsWith(base));
+      return near || null;
+    }
+
+    function speak(text, lang) {
+      if (!text) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = lang;
+
+      const voice = pickBestVoice(lang);
+      if (voice) u.voice = voice;
+
+      // Cancel helps on Android when tapping quickly
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    }
+
+    // ---------- Chunk commit ----------
+    let translating = false;
+
+    async function commitChunk(text) {
+      if (translating) return; // prevents overlapping commits
+      translating = true;
+
+      // reset buffers
+      stableText = "";
+      lastPartial = "";
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = null;
+
+      liveText.textContent = "🎙️ Translating…";
+
+      const from = fromLang.value;
+      const to = toLang.value;
+
+      try {
+        const translated = await translateText(text, from, to);
+        addTranslation(text, translated);
+        liveText.textContent = "🎙️ …";
+        if (audioEnabled) speak(translated, to);
+      } catch (e) {
+        console.warn(e);
+        addTranslation(text, "(translation failed)");
+        liveText.textContent = "🎙️ …";
+      } finally {
+        translating = false;
+      }
+    }
+
+    // ---------- Controls ----------
+    toggleBtn.addEventListener("click", () => {
+      if (!recognition) recognition = initRecognition();
+      if (!recognition) return;
+
+      if (!listening) {
+        recognition.lang = fromLang.value; // BCP-47 like en-US
+        try {
+          recognition.start();
+          listening = true;
+          toggleBtn.textContent = "⏹ Stop";
+          setStatus("🎧 Listening…");
+        } catch (e) {
+          console.warn("start error:", e);
+          setStatus("⚠️ Could not start mic (try again).");
+        }
+      } else {
+        listening = false;
+        toggleBtn.textContent = "▶ Start";
+        setStatus("🛑 Stopped");
+        try { recognition.stop(); } catch(e) {}
+
+        // flush whatever we have
+        const finalish = (stableText + " " + lastPartial).trim();
+        if (finalish) commitChunk(finalish);
+      }
+    });
+
+    replayAllBtn.addEventListener("click", () => {
+      if (allTranslations.length === 0) {
+        alert("No translations to replay yet!");
+        return;
+      }
+
+      // Play sequentially; use onend to chain (more reliable than setTimeout on mobile)
+      let i = 0;
+
+      function playNext() {
+        if (i >= allTranslations.length) return;
+        const u = new SpeechSynthesisUtterance(allTranslations[i]);
+        u.lang = toLang.value;
+        const v = pickBestVoice(toLang.value);
+        if (v) u.voice = v;
+        u.onend = () => { i++; playNext(); };
+        speechSynthesis.speak(u);
+      }
+
+      speechSynthesis.cancel();
+      playNext();
+    });
+
+    clearBtn.addEventListener("click", () => {
+      if (!confirm("Are you sure you want to clear all translations?")) return;
+      translationsDiv.innerHTML = "";
+      liveText.textContent = "🎙️ Live text will appear here...";
+      allTranslations = [];
+      stableText = "";
+      lastPartial = "";
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = null;
+      speechSynthesis.cancel();
+      setStatus("");
+    });
+
+    // ---------- Helpers ----------
+    function escapeHtml(str) {
+      return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    // Some Android devices load voices async
+    window.speechSynthesis.onvoiceschanged = () => {};
+
+  </script>
+</body>
+</html>
