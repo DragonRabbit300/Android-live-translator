@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Real-Time Translator (Samsung)</title>
+  <title>Real-Time Translator (Samsung/Android)</title>
 
   <style>
     body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
@@ -13,14 +13,17 @@
     }
     button:disabled { background: gray; cursor: not-allowed; }
     select { padding: 8px; font-size: 16px; margin: 5px; }
+
     #translations, #liveText {
       margin-top: 20px; text-align: left; max-width: 520px; margin-left: auto; margin-right: auto;
       background: #f8f8f8; padding: 15px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.1);
     }
     #translations { max-height: 280px; overflow-y: auto; }
+
     .chunk {
-      padding: 8px 40px 8px 8px; margin-bottom: 8px; border-radius: 8px;
+      padding: 8px 42px 8px 8px; margin-bottom: 8px; border-radius: 8px;
       background-color: #e0f7fa; position: relative; line-height: 1.25;
+      word-wrap: break-word;
     }
     .replayBtn {
       position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
@@ -28,7 +31,8 @@
       padding: 4px 8px; cursor: pointer; font-size: 12px;
     }
     #liveText { font-style: italic; color: #333; }
-    .small { font-size: 12px; color: #555; margin-top: 10px; }
+    .small { font-size: 12px; color: #555; margin-top: 10px; max-width: 520px; margin-left:auto; margin-right:auto; text-align:left; }
+    .warn { color: #b00020; }
   </style>
 </head>
 
@@ -64,9 +68,18 @@
 
   <div id="liveText">🎙️ Live text will appear here...</div>
   <div id="translations"></div>
+
   <div class="small" id="status"></div>
 
   <script>
+    // =========================
+    // Standalone Samsung/Android Translator
+    // - SpeechRecognition (Chrome/Samsung Internet)
+    // - MyMemory translation (free)
+    // - SpeechSynthesis playback (Android voices)
+    // - Auto chunking via silence + punctuation + max length
+    // =========================
+
     // ---------- UI ----------
     const enableAudioBtn = document.getElementById("enableAudioBtn");
     const toggleBtn = document.getElementById("toggleBtn");
@@ -78,129 +91,82 @@
     const toLang = document.getElementById("toLang");
     const statusEl = document.getElementById("status");
 
-    // ---------- Speech Recognition (Samsung/Android) ----------
+    // ---------- Speech Recognition ----------
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     let recognition = null;
-
     let listening = false;
+
+    // Audio/TTS
     let audioEnabled = false;
 
-    // Chunking state
-    let stableText = "";
-    let lastPartial = "";
+    // Chunking buffers
+    let stableText = "";     // accumulated "final" text
+    let lastPartial = "";    // most recent interim text
     let silenceTimer = null;
+    let translating = false;
 
-    // Tuning knobs (Samsung-friendly defaults)
-    const SILENCE_MS = 900;          // commit after ~0.9s of no updates
-    const MAX_CHUNK_CHARS = 180;     // force commit if too long (prevents runaway)
-    const PUNCTUATION_RE = /[.!?。！？]$/;
-
-    // Replay memory
+    // Replay store
     let allTranslations = [];
 
-    function setStatus(msg) {
+    // Chunk tuning
+    const SILENCE_MS = 900;
+    const MAX_CHUNK_CHARS = 180;
+    const PUNCTUATION_RE = /[.!?。！？]$/;
+
+    function setStatus(msg, isWarn=false) {
+      statusEl.className = "small" + (isWarn ? " warn" : "");
       statusEl.textContent = msg || "";
     }
 
-    enableAudioBtn.addEventListener("click", () => {
-      // Must be user-gesture to allow audio on many mobile browsers
-      audioEnabled = true;
-      enableAudioBtn.disabled = true;
-      enableAudioBtn.textContent = "✅ Audio Enabled";
-      speak("Audio enabled", toLang.value);
-    });
-
-    function initRecognition() {
-      if (!SpeechRecognition) {
-        alert("Speech Recognition is not supported in this browser on this device.");
-        return null;
-      }
-
-      const r = new SpeechRecognition();
-      r.continuous = true;     // Android may still stop; we auto-restart
-      r.interimResults = true;
-      r.maxAlternatives = 1;
-
-      r.onstart = () => setStatus("🎧 Listening…");
-      r.onerror = (e) => {
-        console.warn("Recognition error:", e);
-        setStatus("⚠️ Mic/recognition error: " + (e.error || "unknown"));
-        // Some errors happen transiently; keep UX stable.
-      };
-
-      r.onend = () => {
-        setStatus("⏸️ Recognition ended");
-        // Android browsers frequently end recognition; auto-restart if user is still "listening"
-        if (listening) {
-          setTimeout(() => {
-            try {
-              r.start();
-              setStatus("🔁 Restarted listening…");
-            } catch (err) {
-              // start() can throw if called too quickly
-              console.warn("Restart failed:", err);
-              setTimeout(() => {
-                try { r.start(); } catch(e2) {}
-              }, 800);
-            }
-          }, 250);
-        }
-      };
-
-      r.onresult = (event) => {
-        if (silenceTimer) clearTimeout(silenceTimer);
-
-        let interim = "";
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const t = (event.results[i][0].transcript || "").trim();
-          if (!t) continue;
-
-          if (event.results[i].isFinal) {
-            stableText = (stableText + " " + t).trim();
-            lastPartial = "";
-          } else {
-            interim = t; // most recent interim
-            lastPartial = t;
-          }
-        }
-
-        const display = (stableText + " " + (interim || "")).trim();
-        liveText.textContent = display ? ("🎙️ " + display) : "🎙️ …";
-
-        // Commit on punctuation (natural sentence end)
-        if (display && PUNCTUATION_RE.test(display)) {
-          commitChunk(display);
-          return;
-        }
-
-        // Commit if chunk is getting too long
-        if (display.length >= MAX_CHUNK_CHARS) {
-          commitChunk(display);
-          return;
-        }
-
-        // Commit after silence gap
-        silenceTimer = setTimeout(() => {
-          const finalish = (stableText + " " + lastPartial).trim();
-          if (finalish) commitChunk(finalish);
-        }, SILENCE_MS);
-      };
-
-      return r;
+    // ---------- Safety: HTML escaping ----------
+    function escapeHtml(str) {
+      return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
     }
 
-    // ---------- Translation ----------
+    // ---------- MyMemory translate ----------
     async function translateText(text, fromBcp47, toBcp47) {
-      // MyMemory needs ISO 639-1 codes like en|es, not BCP-47 like en-US
-      const from = fromBcp47.split("-")[0];
+      const from = fromBcp47.split("-")[0]; // en-US -> en
       const to = toBcp47.split("-")[0];
-
       const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`;
       const res = await fetch(url);
       const data = await res.json();
       return data?.responseData?.translatedText || "(translation failed)";
     }
 
+    // ---------- Speech synthesis ----------
+    function pickBestVoice(lang) {
+      const voices = speechSynthesis.getVoices() || [];
+      if (!voices.length) return null;
+
+      const exact = voices.find(v => (v.lang || "").toLowerCase() === lang.toLowerCase());
+      if (exact) return exact;
+
+      const base = lang.split("-")[0].toLowerCase();
+      return voices.find(v => (v.lang || "").toLowerCase().startsWith(base)) || null;
+    }
+
+    function speak(text, lang) {
+      if (!text) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = lang;
+
+      const voice = pickBestVoice(lang);
+      if (voice) u.voice = voice;
+
+      // Cancel helps prevent overlapping spam on Android
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    }
+
+    // Some Android devices load voices async
+    window.speechSynthesis.onvoiceschanged = () => {};
+
+    // ---------- Add translation chunk ----------
     function addTranslation(original, translated) {
       const chunkDiv = document.createElement("div");
       chunkDiv.className = "chunk";
@@ -218,38 +184,11 @@
       allTranslations.push(translated);
     }
 
-    // ---------- TTS ----------
-    function pickBestVoice(lang) {
-      const voices = speechSynthesis.getVoices() || [];
-      if (!voices.length) return null;
-
-      // Prefer exact match (en-US), then same language (en)
-      const exact = voices.find(v => (v.lang || "").toLowerCase() === lang.toLowerCase());
-      if (exact) return exact;
-
-      const base = lang.split("-")[0].toLowerCase();
-      const near = voices.find(v => (v.lang || "").toLowerCase().startsWith(base));
-      return near || null;
-    }
-
-    function speak(text, lang) {
-      if (!text) return;
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = lang;
-
-      const voice = pickBestVoice(lang);
-      if (voice) u.voice = voice;
-
-      // Cancel helps on Android when tapping quickly
-      speechSynthesis.cancel();
-      speechSynthesis.speak(u);
-    }
-
-    // ---------- Chunk commit ----------
-    let translating = false;
-
+    // ---------- Commit current chunk ----------
     async function commitChunk(text) {
-      if (translating) return; // prevents overlapping commits
+      const cleaned = (text || "").trim();
+      if (!cleaned || translating) return;
+
       translating = true;
 
       // reset buffers
@@ -260,30 +199,111 @@
 
       liveText.textContent = "🎙️ Translating…";
 
-      const from = fromLang.value;
-      const to = toLang.value;
-
       try {
-        const translated = await translateText(text, from, to);
-        addTranslation(text, translated);
+        const translated = await translateText(cleaned, fromLang.value, toLang.value);
+        addTranslation(cleaned, translated);
         liveText.textContent = "🎙️ …";
-        if (audioEnabled) speak(translated, to);
+        if (audioEnabled) speak(translated, toLang.value);
       } catch (e) {
         console.warn(e);
-        addTranslation(text, "(translation failed)");
+        addTranslation(cleaned, "(translation failed)");
         liveText.textContent = "🎙️ …";
       } finally {
         translating = false;
       }
     }
 
-    // ---------- Controls ----------
+    // ---------- Init recognition ----------
+    function initRecognition() {
+      if (!SpeechRecognition) {
+        setStatus("Speech Recognition not supported in this browser. Use Chrome or Samsung Internet.", true);
+        alert("Speech Recognition not supported in this browser on this device. Use Chrome or Samsung Internet.");
+        return null;
+      }
+
+      const r = new SpeechRecognition();
+      r.continuous = true;
+      r.interimResults = true;
+      r.maxAlternatives = 1;
+
+      r.onstart = () => setStatus("🎧 Listening…");
+      r.onerror = (e) => {
+        console.warn("Recognition error:", e);
+        setStatus("⚠️ Mic/recognition error: " + (e.error || "unknown") + " (try stopping and starting again)", true);
+      };
+
+      // Android often ends recognition randomly; restart if user is still listening
+      r.onend = () => {
+        if (listening) {
+          setStatus("🔁 Restarting listening…");
+          setTimeout(() => {
+            try { r.start(); }
+            catch (err) {
+              console.warn("Restart failed:", err);
+              setTimeout(() => { try { r.start(); } catch(e2) {} }, 800);
+            }
+          }, 250);
+        } else {
+          setStatus("🛑 Stopped");
+        }
+      };
+
+      r.onresult = (event) => {
+        if (silenceTimer) clearTimeout(silenceTimer);
+
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const t = (event.results[i][0].transcript || "").trim();
+          if (!t) continue;
+
+          if (event.results[i].isFinal) {
+            stableText = (stableText + " " + t).trim();
+            lastPartial = "";
+          } else {
+            interim = t;
+            lastPartial = t;
+          }
+        }
+
+        const display = (stableText + " " + (interim || "")).trim();
+        liveText.textContent = display ? ("🎙️ " + display) : "🎙️ …";
+
+        // commit on punctuation end
+        if (display && PUNCTUATION_RE.test(display)) {
+          commitChunk(display);
+          return;
+        }
+
+        // commit if too long
+        if (display.length >= MAX_CHUNK_CHARS) {
+          commitChunk(display);
+          return;
+        }
+
+        // commit after silence gap
+        silenceTimer = setTimeout(() => {
+          const finalish = (stableText + " " + lastPartial).trim();
+          if (finalish) commitChunk(finalish);
+        }, SILENCE_MS);
+      };
+
+      return r;
+    }
+
+    // ---------- Buttons ----------
+    enableAudioBtn.addEventListener("click", () => {
+      audioEnabled = true;
+      enableAudioBtn.disabled = true;
+      enableAudioBtn.textContent = "✅ Audio Enabled";
+      speak("Audio enabled", toLang.value);
+    });
+
     toggleBtn.addEventListener("click", () => {
       if (!recognition) recognition = initRecognition();
       if (!recognition) return;
 
       if (!listening) {
-        recognition.lang = fromLang.value; // BCP-47 like en-US
+        recognition.lang = fromLang.value; // en-US, es-ES, etc.
         try {
           recognition.start();
           listening = true;
@@ -291,17 +311,19 @@
           setStatus("🎧 Listening…");
         } catch (e) {
           console.warn("start error:", e);
-          setStatus("⚠️ Could not start mic (try again).");
+          setStatus("⚠️ Could not start mic. Grant permission, then tap Start again.", true);
         }
       } else {
         listening = false;
         toggleBtn.textContent = "▶ Start";
-        setStatus("🛑 Stopped");
         try { recognition.stop(); } catch(e) {}
 
-        // flush whatever we have
+        // flush what we have
         const finalish = (stableText + " " + lastPartial).trim();
         if (finalish) commitChunk(finalish);
+
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = null;
       }
     });
 
@@ -311,10 +333,11 @@
         return;
       }
 
-      // Play sequentially; use onend to chain (more reliable than setTimeout on mobile)
+      // Chain playback (more reliable than timeouts on mobile)
       let i = 0;
+      speechSynthesis.cancel();
 
-      function playNext() {
+      const playNext = () => {
         if (i >= allTranslations.length) return;
         const u = new SpeechSynthesisUtterance(allTranslations[i]);
         u.lang = toLang.value;
@@ -322,9 +345,8 @@
         if (v) u.voice = v;
         u.onend = () => { i++; playNext(); };
         speechSynthesis.speak(u);
-      }
+      };
 
-      speechSynthesis.cancel();
       playNext();
     });
 
@@ -341,19 +363,8 @@
       setStatus("");
     });
 
-    // ---------- Helpers ----------
-    function escapeHtml(str) {
-      return String(str)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-    }
-
-    // Some Android devices load voices async
-    window.speechSynthesis.onvoiceschanged = () => {};
-
+    // Helpful note for users opening the page
+    setStatus("Tip: On Samsung, open in Chrome or Samsung Internet. Tap 'Enable Audio' before you want speech playback.");
   </script>
 </body>
 </html>
